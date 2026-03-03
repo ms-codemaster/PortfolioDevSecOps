@@ -1,0 +1,245 @@
+pipeline { 
+    agent any
+
+    // Variables d’environnement globales
+    environment {
+        BACKEND_IMAGE = "jobfinderproject-backend"
+        FRONTEND_IMAGE = "jobfinderproject-frontend"
+        K8S_NAMESPACE = "jobfinder"
+        ZAP_REPORT_DIR = "${WORKSPACE}/jobfinderproject/zap-reports"
+    }
+
+    stages {
+
+        // =========================
+        // Clone du dépôt Git
+        // =========================
+        stage('git clone') {
+            steps {
+                git(
+                    branch: 'projetJobFiderDeployment',
+                    credentialsId: 'ssh',
+                    url: 'git@gitlab.com:abyrbrahim/jobfinderproject.git'
+                )
+                echo 'Clone done successfully'
+            }
+        }
+
+        // =========================
+        // SAST – Scan de secrets avec Gitleaks
+        // =========================
+        stage('SAST - Gitleaks Scan') {
+            steps {
+                script {
+                    def gitleaksReport = "${env.WORKSPACE}/gitleaks-report.json"
+                    sh """
+                        echo "Running Gitleaks scan..."
+                        gitleaks detect --source . --report-path ${gitleaksReport} --exit-code 0
+                        echo "Gitleaks scan finished. Report saved at ${gitleaksReport}"
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                    echo "Gitleaks report archived."
+                }
+            }
+        }
+
+        // =========================
+        // SCA – Scan des dépendances avec Trivy
+        // =========================
+        stage('SCA - Trivy Scan Dependencies') {
+            steps {
+                script {
+                    sh '''
+                        set +e
+                        mkdir -p trivy-reports
+                        curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
+                        trivy fs ./backend --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output trivy-reports/backend.json || true
+                        trivy fs ./backend --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format template --template "@html.tpl" --output trivy-reports/backend.html || true
+                        trivy fs ./frontend --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output trivy-reports/frontend.json || true
+                        trivy fs ./frontend --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format template --template "@html.tpl" --output trivy-reports/frontend.html || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-reports/*.*', allowEmptyArchive: true
+                    echo "Trivy full HTML & JSON reports archived."
+                }
+            }
+        }
+
+        // =========================
+        // Build et scan des images Docker (parallel)
+        // =========================
+        stage('Build & Scan Docker Images') {
+            parallel {
+                stage('Backend: Build & Trivy Scan') {
+                    steps {
+                        sh '''
+                            mkdir -p trivy-reports/backend
+                            docker rmi -f $BACKEND_IMAGE || true
+                            docker build -t $BACKEND_IMAGE ./backend
+                            trivy image --severity HIGH,CRITICAL --format template --template "@html.tpl" --output trivy-reports/backend/backend.html $BACKEND_IMAGE
+                        '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'trivy-reports/backend/*', allowEmptyArchive: true
+                            echo "Backend Trivy reports archived."
+                        }
+                    }
+                }
+
+                stage('Frontend: Build & Trivy Scan') {
+                    steps {
+                        sh '''
+                            mkdir -p trivy-reports/frontend
+                            docker rmi -f $FRONTEND_IMAGE || true
+                            docker build -t $FRONTEND_IMAGE ./frontend
+                            trivy image --severity HIGH,CRITICAL --format template --template "@html.tpl" --output trivy-reports/frontend/frontend.html $FRONTEND_IMAGE
+                        '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'trivy-reports/frontend/*', allowEmptyArchive: true
+                            echo "Frontend Trivy reports archived."
+                        }
+                    }
+                }
+            }
+        }
+
+        // =========================
+        // Analyse de code avec SonarQube
+        // =========================
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh "/opt/sonar-scanner/bin/sonar-scanner"
+                }
+            }
+        }
+
+        // =========================
+        // Vérification du Quality Gate SonarQube
+        // =========================
+        stage('Quality Gate of SonarQube') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // =========================
+        // Push des images vers DockerHub
+        // =========================
+        stage('Push Images to DockerHub') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')
+                ]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker tag $BACKEND_IMAGE $DOCKER_USER/$BACKEND_IMAGE:$BUILD_NUMBER
+                        docker tag $FRONTEND_IMAGE $DOCKER_USER/$FRONTEND_IMAGE:$BUILD_NUMBER
+                        docker push $DOCKER_USER/$BACKEND_IMAGE:$BUILD_NUMBER
+                        docker push $DOCKER_USER/$FRONTEND_IMAGE:$BUILD_NUMBER
+                    '''
+                }
+            }
+        }
+
+        // =========================
+        // Déploiement sur Kubernetes + Rollback
+        // =========================
+        stage('Deploy to Kubernetes (Rollback Safe)') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'k8s', variable: 'KUBECONFIG_FILE')
+                ]) {
+                    sh '''
+                        set -e
+                        export KUBECONFIG=$KUBECONFIG_FILE
+
+                        echo "▶ Applying Kubernetes manifests..."
+                        kubectl apply -f k8s/namespace.yaml
+                        kubectl apply -f k8s/
+
+                        echo "▶ Waiting for backend rollout..."
+                        if ! kubectl rollout status deployment/jobfinder-backend -n $K8S_NAMESPACE --timeout=120s; then
+                            echo "❌ Backend rollout failed → rollback"
+                            kubectl rollout undo deployment/jobfinder-backend -n $K8S_NAMESPACE
+                            exit 1
+                        fi
+
+                        echo "▶ Waiting for frontend rollout..."
+                        if ! kubectl rollout status deployment/jobfinder-frontend -n $K8S_NAMESPACE --timeout=120s; then
+                            echo "❌ Frontend rollout failed → rollback"
+                            kubectl rollout undo deployment/jobfinder-frontend -n $K8S_NAMESPACE
+                            exit 1
+                        fi
+
+                        echo "✅ Deployment successful (no rollback needed)"
+                        kubectl get pods -n $K8S_NAMESPACE
+                        kubectl get svc -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        // =========================
+        // DAST – Scan avec OWASP ZAP
+        // =========================
+        stage('DAST Scan') {
+            steps {
+                script {
+                    def reportName = "report${env.BUILD_NUMBER}.html"
+                    withCredentials([string(credentialsId: 'TARGET_URL_SECRET', variable: 'TARGET_URL')]) {
+                        sh '''
+                            mkdir -p $ZAP_REPORT_DIR
+                            chmod 777 $ZAP_REPORT_DIR
+                        '''
+                        def zapStatus = sh(
+                            script: """
+                                docker run --rm -u root \
+                                -v $ZAP_REPORT_DIR:/zap/wrk \
+                                ghcr.io/zaproxy/zaproxy:stable \
+                                zap-baseline.py -t "$TARGET_URL" -r "$reportName"
+                            """,
+                            returnStatus: true
+                        )
+                        if (zapStatus == 1) { error("ZAP detected HIGH/CRITICAL vulnerabilities ❌") }
+                        if (zapStatus == 2) { unstable("ZAP detected WARN vulnerabilities ⚠") }
+                        archiveArtifacts artifacts: "jobfinderproject/zap-reports/${reportName}", allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================
+    // Actions post-pipeline
+    // =========================
+    post {
+        always {
+            archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+            emailext(
+                subject: "$JOB_NAME - Build #$BUILD_NUMBER - ${currentBuild.currentResult}",
+                body: """
+                    <h2>Résultat du Pipeline</h2>
+                    <p><b>Projet :</b> $JOB_NAME</p>
+                    <p><b>Build Number :</b> $BUILD_NUMBER</p>
+                    <p><b>Status :</b> ${currentBuild.currentResult}</p>
+                    <p><a href="$BUILD_URL">Lien vers le build</a></p>
+                """,
+                mimeType: 'text/html',
+                to: 'mscodemaster@gmail.com'
+            )
+        }
+    }
+}
