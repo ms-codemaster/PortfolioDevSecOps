@@ -236,6 +236,7 @@ pipeline {
                     <p><b>Build Number :</b> $BUILD_NUMBER</p>
                     <p><b>Status :</b> ${currentBuild.currentResult}</p>
                     <p><a href="$BUILD_URL">Lien vers le build</a></p>
+                    <p><a href="$BUILD_URL/ZAP_20DAST_20Report/">:page_facing_up: Rapport ZAP DAST</a></p>
                 """,
                 mimeType: 'text/html',
                 to: 'mscodemaster@gmail.com'
