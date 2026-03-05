@@ -1,6 +1,41 @@
-# PortfolioDevSecOps
+# Portfolio DevSecOps_JobFinderProject
 DevSecOps project focused on secure CI/CD pipelines, infrastructure as code, and automated security testing.
-DevSecOps Portfolio – JobFinder Dashboard
+
+# Architecture du Projet
+Application déployée sous forme de microservices containerisés :
+Utilisateur
+     │
+     ▼
+Frontend (Node.js)
+     │
+     ▼
+Backend (Node.js API)
+     │
+     ▼
+Database
+
+L’ensemble est :
+-> Containerisé avec Docker
+-> Déployé sur Kubernetes
+-> Automatisé via Jenkins Pipeline
+-> Sécurisé via des outils DevSecOps
+
+# Stack Technique
+
+| Domaine          | Outil      |
+| ---------------- | ---------- |
+| Backend          | Node.js    |
+| Frontend         | Node.js    |
+| Containerisation | Docker     |
+| Orchestration    | Kubernetes |
+| CI/CD            | Jenkins    |
+| Analyse statique | SonarQube  |
+| SAST             | Gitleaks   |
+| SCA              | Trivy      |
+| DAST             | OWASP ZAP  |
+| Registry         | DockerHub  |
+| Versionning      | GitLab     |
+
 
 Ce projet démontre la mise en place d'une chaîne DevSecOps complète autour d’une application Node.js composée d’un frontend et d’un backend.
 
